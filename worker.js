@@ -1,4 +1,4 @@
-var config = require('config');
+var config = JSON.parse(process.env.config);
 var redis = require('redis');
 var _ = require('lodash');
 var EventEmitter = require('events');
@@ -6,21 +6,28 @@ var os = require('os');
 
 var client = redis.createClient(config.redis);
 var subscribeClient = redis.createClient(config.redis); // subscribing client
-var processPrefix = process.env.parent;
-var messagesCount = Number(process.env.count);
+var processPrefix = process.env.parent + ':';
 
 if (config.redis.db) {
   client.select(config.redis.db);
   subscribeClient.select(config.redis.db);
 }
 
-function getMessage () {
-  getMessage.cnt = getMessage.cnt || 0;
-  return getMessage.cnt++;
+function logErr (err) {
+  if (err) {
+    console.error(err);
+  }
 }
 
+// функция из задания, без изменений
+function getMessage () {
+  getMessage.cnt = getMessage.cnt || 0;
+  return ++getMessage.cnt;
+}
+
+// функция из задания, без изменений
 function eventHandler (msg, callback) {
-  setTimeout(onComplete, Math.floor(Math.random() * config.handlerTimeout));
+  setTimeout(onComplete, Math.floor(Math.random() * config.listenerDelay));
   function onComplete () {
     var error = Math.random() > 0.85;
     callback(error && 'LISTENER_ERROR');
@@ -28,103 +35,130 @@ function eventHandler (msg, callback) {
 }
 
 function getKey (key) {
-  return config.prefix + key;
+  return config.prefix  + processPrefix + key;
 }
 
 function Handler () {
-  this.id = os.hostname() + '_' + process.id;
+  // идентификатор текущего обработчика
+  this.id = os.hostname() + '_' + process.pid;
   this.role = 'listener'; // listener or generator
   this.events = new EventEmitter;
+  this.events.setMaxListeners(0);
   this.listeners = [];
   this.listenerIndex = 0;
+  // итератор отсылаемых сообщений данным воркером, не связан с getMessage()
   this.msgIndex = 0;
-
+  // мы должны знать, какой генератор у нас текущий. Т.к. теоретически могут быть коллизии,
+  // когда один генератор отвалится, а потом начнет слать сообщения
   this.currentGenerator = null;
-
-  this.tryToBeAGenerator();
-
-  setInterval(this.heartbit.bind(this), 1e3);
-
-  this.events.on('generatorExpire', function () {
-    this.currentGenerator = null;
-    this.tryToBeAGenerator();
-  }.bind(this));
-
-  this.events.on('listenerExpire', function (listener) {
-    _.remove(this.listeners, listener);
-  }.bind(this));
-
-  this.events.on('newListener', function () {
-    this.updateListeners();
-  }.bind(this));
-
-  this.events.on('message', function (meta, message) {
-    if (meta.listener === this.id) {
-      if (meta.generator === this.currentGenerator) {
-        eventHandler(message, function (err, res) {
-          this.emit('response', meta, err, res);
-        }.bind(this));
-      } else {
-        this.emit('response', meta, 'BAD_GENERATOR');
-      }
-    }
-  }.bind(this));
-
-  this.events.on('response', function (meta, err, res) {
-    if (meta.generator === this.id) {
-      this.events.emit('result', meta, err, res);
-    }
-  }.bind(this));
-
-  subscribeClient.subscribe('__keyevent@' + (config.redis.db || 0) + '__:expired', this.getChannelKey);
-
-  subscribeClient.on('message', function (channel, message) {
-    if (channel === this.getChannelKey()) {
-      this.events.emit.apply(this.events, JSON.parse(message));
-    } else {
-      if (message.indexOf(getKey(processPrefix + ':listener')) === 0) {
-        listener = message.replace(getKey(processPrefix + ':listener:'), '').split(':')[0];
-        this.events.emit('listenerExpire', listener);
-      } else if (message.indexOf(getKey(processPrefix + ':generator')) === 0) {
-        this.events.emit('generatorExpire');
-      }
-    }
-  }.bind(this));
-
 }
 
 
 _.extend(Handler.prototype, {
 
-  updateListeners: function () {
-    client.keys(getKey(processPrefix + ':listener:*'), function (keys), {
-      this.listeners = [];
-      keys.forEach(function (_key) {
-        this.listeners.push(_key.replace(getKey(processPrefix + ':listener:')));
-      }.bind(this));
+  init: function () {
+    this.tryToBeAGenerator();
+
+    // чекаем, что соединение в порядке, иначе никак :(
+    setInterval(this.heartbeat.bind(this), 1e3);
+
+    // сдох генератор
+    this.events.on('generatorExpire', function () {
+      this.currentGenerator = null;
+      this.tryToBeAGenerator();
+    }.bind(this));
+
+    // сдох один из слушателей, больше не отправляем ему сообщения
+    this.events.on('listenerExpire', function (listener) {
+      _.remove(this.listeners, listener);
+    }.bind(this));
+
+    // пришел новый слушатель, обновим список с ними
+    this.events.on('newListener', function () {
+      if (this.role === 'generator') {
+        this.updateListeners(logErr);
+      }
+    }.bind(this));
+
+    // пришло сообщение от генератора
+    this.events.on('message', function (meta, message) {
+      if (meta.listener === this.id) {
+        if (meta.generator === this.currentGenerator) {
+          eventHandler(message, function (err, res) {
+            this.emit('response', meta, err, res);
+          }.bind(this));
+        } else {
+          this.emit('response', meta, 'BAD_GENERATOR');
+        }
+      }
+    }.bind(this));
+
+    // пришел ответ от слушателя
+    this.events.on('response', function (meta, err, res) {
+      if (meta.generator === this.id) {
+        this.events.emit('result', meta, err, res);
+      }
+    }.bind(this));
+
+    // подписываемся на протухание ключей (для heartbeat) и на сообщения от генератора/слушателя
+    subscribeClient.subscribe('__keyevent@' + (config.redis.db || 0) + '__:expired', this.getChannelKey());
+
+    subscribeClient.on('message', function (channel, message) {
+      if (channel === this.getChannelKey()) {
+        this.events.emit.apply(this.events, JSON.parse(message));
+      } else {
+        if (message.indexOf(getKey('listener')) === 0) {
+          listener = message.replace(getKey('listener:'), '').split(':')[0];
+          this.events.emit('listenerExpire', listener);
+        } else if (message.indexOf(getKey('generator')) === 0) {
+          this.events.emit('generatorExpire');
+        }
+      }
     }.bind(this));
   },
 
-  startGenerator: function () {
-    if (this.role === 'generator') {
-      this.generatorInterval = setInterval(this.emitMessage.bind(this), config.generateTimeout);
-    }
+  // держим список обработчиков, чтобы
+  updateListeners: function (callback) {
+    client.keys(getKey('listener*'), function (err, keys) {
+      if (err) {
+        return callback(err);
+      }
+      this.listeners = [];
+      if (keys) {
+        keys.forEach(function (_key) {
+          this.listeners.push(_key.replace(getKey('listener:'), ''));
+        }.bind(this));
+      }
+      callback();
+    }.bind(this));
   },
 
-  heartbit: function () {
+  // запускаем генератор
+  runGenerator: function () {
+    setTimeout(function () {
+      if (config.messages > (getMessage.cnt || 0)) {
+        this.emitMessage();
+        this.runGenerator();
+      } else {
+        process.send('done');
+      }
+    }.bind(this), config.generateDelay);
+  },
+
+  heartbeat: function () {
     if (this.role === 'listener') {
-      client.setex(this.getListenerKey(), this.id, 2);
+      client.set(this.getListenerKey(), this.id, 'EX', 2);
     }
     else if (this.role === 'generator') {
-      client.setex(this.getGeneratorKey(), this.id, 2)
+      client.set(this.getGeneratorKey(), this.id, 'EX', 2)
     }
   },
 
+  // воркер пытается стать генератором
   tryToBeAGenerator: function () {
-    client.set(this.getGeneratorKey(), this.id, 2, undefined, true, function (err, res) {
+    client.set(this.getGeneratorKey(), this.id, 'EX', 2, 'NX', function (err, res) {
       if (err) {
-        console.error(err);
-        return process.exit(1);
+        return logErr(err);
       }
       if (res) {
         if (this.role != 'generator') {
@@ -132,47 +166,58 @@ _.extend(Handler.prototype, {
           this.currentGenerator = this.id;
           this.updateListeners(function (err) {
             if (err) {
-              console.error(err);
-              return;
+              return logErr(err);
             }
-            this.get(getKey(processPrefix + ':counter'), function (key) {
+            client.get(getKey('counter'), function (err, key) {
+              if (err) {
+                return logErr(err);
+              }
               getMessage.cnt = Number(key);
-              this.startGenerator();
+              this.runGenerator();
             }.bind(this));
           }.bind(this));
         }
       } else {
         this.role = 'listener';
-        client.get(getGeneratorKey(), function (err, res) {
-          this.currentGenerator = this.id;
+        client.set(this.getListenerKey(), this.id, 'EX', 2, function (err) {
+          if (err) {
+            return logErr(err);
+          }
+          this.emit('newListener');
+        }.bind(this));
+        client.get(this.getGeneratorKey(), function (err, res) {
+          if (err) {
+            return logErr(err);
+          }
+          this.currentGenerator = res;
         }.bind(this));
       }
     }.bind(this));
   },
 
   getChannelKey: function () {
-    return getKey(processPrefix + ':channel');
+    return getKey('channel');
   },
 
   getListenerKey: function () {
-    return getKey(processPrefix + ':listener:' + this.id);
+    return getKey('listener:' + this.id);
   },
 
   getGeneratorKey: function () {
-    return getKey(processPrefix + ':generator');
+    return getKey('generator');
   },
 
   emitMessage: function (callback) {
     var message = getMessage();
     this.sendMessage(message, function (err, meta, res) {
-      var message = 'Generator: ' + this.id + '. Message: ' + message + '. Listener: ' + meta.listener;
+      var msg = 'Generator: ' + this.id + '. Message: ' + message + '. Listener: ' + meta.listener;
       if (err) {
         this.saveError(err);
-        console.error('Error occured: ' + err + '. ' + message);
+        logErr('Error occured: ' + err + '. ' + msg);
       } else {
-        console.log('Success. ' + message);
+        console.log('Success. ' + msg);
       }
-      this.incr(getKey(processPrefix + ':counter'), callback)
+      client.incr(getKey('counter'), callback)
     }.bind(this));
   },
 
@@ -181,10 +226,11 @@ _.extend(Handler.prototype, {
       date: new Date(),
       err: err
     }
-    client.lpush(getKey('errors'), error);
+    client.lpush(config.prefix + 'errors', JSON.stringify(error), logErr);
   },
 
   sendMessage: function (message, callback) {
+    // выбираем следующего получателя через round-robin
     var listener = this.getNextListener();
     if (!listener) {
       setTimeout(function () {
@@ -205,23 +251,24 @@ _.extend(Handler.prototype, {
     }
   },
 
+  // отправляем сообщение выбранному слушателю
   sendToListener: function (listener, message, callback) {
     var meta = {
-      listner: listner,
+      listener: listener,
       messageId: this.getMessageId(),
       generator: this.id
     };
     var removeListeners = function () {
-      this.events.removeEventListener('result', onResult);
-      this.events.removeEventListener('listenerExpire', onDropListener);
-    };
+      this.events.removeListener('result', onResult);
+      this.events.removeListener('listenerExpire', onListenerExpire);
+    }.bind(this);
     var onResult = function (_meta, err, res) {
       if (meta.messageId === _meta.messageId) {
         removeListeners();
         callback(err, meta, res);
       }
     };
-    var onDropListener = function (droppedListener) {
+    var onListenerExpire = function (droppedListener) {
       if (droppedListener === listener) {
         removeListeners();
         callback('NOT_REACHABLE', meta);
@@ -229,7 +276,7 @@ _.extend(Handler.prototype, {
     };
     this.emit('message', meta, message);
     this.events.on('result', onResult);
-    this.events.on('listenerExpire', onDropHandler);
+    this.events.on('listenerExpire', onListenerExpire);
   },
 
   getNextListener: function () {
@@ -244,8 +291,10 @@ _.extend(Handler.prototype, {
   },
 
   emit: function () {
-    var args = JSON.stringify(arguments.slice(0));
-    client.publish(this.getChannelKey(), args);
+    client.publish(this.getChannelKey(), JSON.stringify([].slice.call(arguments)));
   },
 
 });
+
+
+new Handler().init();

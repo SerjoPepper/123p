@@ -7,10 +7,10 @@ module.exports = {
   },
 
   workers: 10,
-  count: 500, // messages count
+  messages: 10, // messages count
 
-  generateTimeout: 500,
-  listenerTimeout: 500,
+  generateDelay: 200,
+  listenerDelay: 200,
 
   prefix: '123p:' // redis keys prefix
 
